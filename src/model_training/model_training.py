@@ -1,7 +1,7 @@
 import os
 import random
 import numpy as np
-import cPickle as pickle
+import pickle
 import keras.backend as K
 from keras.models import Model
 from keras.layers import Input, Lambda, Dot
@@ -10,10 +10,10 @@ from keras.callbacks import CSVLogger
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 from keras.backend.tensorflow_backend import set_session
 import tensorflow as tf
-config = tf.ConfigProto()
+config = tf.compat.v1.ConfigProto()
 config.gpu_options.allow_growth = True  # dynamically grow the memory used on the GPU
 config.log_device_placement = False  # to log device placement (on which device the operation ran)
-sess = tf.Session(config=config)
+sess = tf.compat.v1.Session(config=config)
 set_session(sess)  # set this TensorFlow session as the default session for Keras
 
 # This is tuned hyper-parameters
@@ -23,82 +23,155 @@ emb_size = 64
 number_epoch = 30
 
 description = 'Triplet_Model'
-Training_Data_PATH = '../../dataset/extracted_AWF775/'
-print Training_Data_PATH
-print "with parameters, Alpha: %s, Batch_size: %s, Embedded_size: %s, Epoch_num: %s"%(alpha, batch_size_value, emb_size, number_epoch)
+# Training_Data_PATH = '../../dataset/extracted_AWF775/' # 旧的数据路径
+Training_Data_PATH = './dataset/ts_mon.pkl'  # 新的数据集文件路径
+print(Training_Data_PATH)
+print("with parameters, Alpha: %s, Batch_size: %s, Embedded_size: %s, Epoch_num: %s"%(alpha, batch_size_value, emb_size, number_epoch))
 
 
 alpha_value = float(alpha)
-print description
+print(description)
 
 # ================================================================================
 # This part is to prepare the files' index for geenrating triplet examples
 # and formulating each epoch inputs
 
-# Extract all folders' names
-dirs = sorted(os.listdir(Training_Data_PATH))
+# Load the dataset from the single pkl file
+with open(Training_Data_PATH, 'rb') as handle:
+    dataset = pickle.load(handle)  # dataset is a dict {site_id: [traces]}
 
-# Each given folder name (URL of each class), we assign class id
-# e.g. {'adp.com' : 23, ...}
-name_to_classid = {d:i for i,d in enumerate(dirs)}
+# site_ids (integers or strings) will be used as classids directly or mapped to integers if needed.
+# For simplicity, let's assume site_ids are 0-indexed or can be mapped to 0-indexed classids.
 
-# Just reverse from previous step
-# Each given class id, show the folder name (URL of each class)
-# e.g. {23 : 'adp.com', ...}
-classid_to_name = {v:k for k,v in name_to_classid.items()}
+site_ids = sorted(list(dataset.keys()))
+num_classes = len(site_ids)
+print("number of classes: " + str(num_classes))
 
-num_classes = len(name_to_classid)
-print "number of classes: "+str(num_classes)
+# Create mappings: classid_to_name (optional, for debugging/logging if site_ids are not descriptive enough)
+# and name_to_classid (optional)
+# If site_ids are already 0, 1, 2..., num_classes-1, then classid_to_name can map these to original site_id strings.
+# For now, we will directly use the site_ids from the pkl file as class identifiers internally.
 
-# Each directory, there are n traces corresponding to the identity
-# We map each trace path with an integer id, then build dictionaries
-# We are mapping
-#   path_to_id and id_to_path
-#   classid_to_ids and id_to_classid
+# Let's create a mapping from original site_id to a 0-indexed integer class_id
+name_to_classid = {site_id: i for i, site_id in enumerate(site_ids)}
+classid_to_name = {i: site_id for i, site_id in enumerate(site_ids)}
 
-# read all directories
-# c is class
-# name_to_classid.items() contains [(directory, classid), ('slickdeals.net', 547), ...]
+all_traces_list = [] # Temporary list to hold all traces
+id_counter = 0
+classid_to_ids = {i: [] for i in range(num_classes)} # classid (0-indexed) -> list of trace_ids
+id_to_classid = {} # trace_id -> classid (0-indexed)
 
-trace_paths = {c:[directory + "/" + img for img in sorted(os.listdir(Training_Data_PATH + directory))]
-         for directory,c in name_to_classid.items()}
-# trace_paths --> {0: ['104.com.tw/104.com.tw_0001.pkl', '104.com.tw/104.com.tw_0002.pkl',...] ,....}
+for original_site_id, traces_for_site in dataset.items():
+    current_class_id = name_to_classid[original_site_id]
+    for trace_data in traces_for_site:
+        all_traces_list.append(trace_data)
+        classid_to_ids[current_class_id].append(id_counter)
+        id_to_classid[id_counter] = current_class_id
+        id_counter += 1
 
-# retreive all traces
-# to create the list of all traces paths
-all_traces_path = []
-for trace_list in trace_paths.values():
-    all_traces_path += trace_list
-# all_trace_path --> ['104.com.tw/104.com.tw_0001.pkl', '104.com.tw/104.com.tw_0002.pkl',...]
-# len(all_trace_path = num_class * num_examples e.g. 700 * 25
+all_traces = np.array(all_traces_list)
+# Ensure traces have the correct shape [num_samples, sequence_length]
+# The README.md mentions: "The sequences are trimmed or padded with 0’s as need to reach a fixed length of 5,000 packets.
+# Thus, the input forms a 1-D array of [1 x 5000]."
+# And the original code does: all_traces = all_traces[:, :, np.newaxis]
+# This suggests each trace_data in all_traces_list should be a 1D array of length 5000.
+# If trace_data is already [5000], then np.array(all_traces_list) will be [N, 5000].
+# Then we add the channel dimension.
+if all_traces.ndim == 2: # Expected shape (num_total_traces, sequence_length)
+    all_traces = all_traces[:, :, np.newaxis] # Add channel dimension for Conv1D -> (N, 5000, 1)
+elif all_traces.ndim == 3 and all_traces.shape[2] == 1:
+    pass # Already in correct shape
+else:
+    # Potentially handle cases where traces are not lists of numbers but more complex objects
+    # For now, assuming they are 1D arrays or lists of numbers as per description
+    # This might require padding/trimming if not already done in the pkl file
+    # For simplicity, assuming traces are already processed to fixed length 5000
+    processed_traces = []
+    for trace in all_traces_list:
+        # Add padding/trimming logic here if necessary
+        # Example: Pad with 0 to length 5000
+        trace_arr = np.array(trace)
+        if len(trace_arr) > 5000:
+            trace_arr = trace_arr[:5000]
+        elif len(trace_arr) < 5000:
+            trace_arr = np.pad(trace_arr, (0, 5000 - len(trace_arr)), 'constant')
+        processed_traces.append(trace_arr)
+    all_traces = np.array(processed_traces)
+    all_traces = all_traces[:, :, np.newaxis]
 
-# map to integers
-# just map each path to sequence of ID (from 1 to len(all_trace_path)
-path_to_id = {v: k for k, v in enumerate(all_traces_path)}
-# path_to_id --> {'chron.com/chron.com_0006.pkl': 1185, 'habrahabr.ru/habrahabr.ru_0001.pkl': 2680, ...}
-id_to_path = {v: k for k, v in path_to_id.items()}
-# id_to_path --> {0: '104.com.tw/104.com.tw_0001.pkl', 1: '104.com.tw/104.com.tw_0002.pkl', ...}
+print("Load traces with ", all_traces.shape)
+print("Total size allocated on RAM : ", str(all_traces.nbytes / 1e6) + ' MB')
 
-# build mapping between traces and class
-classid_to_ids = {k: [path_to_id[path] for path in v] for k, v in trace_paths.items()}
-# classid_to_ids --> {0: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 1: [10, 11, 12, 13, 14, 15, 16, 17, 18, 19],...]
-id_to_classid = {v: c for c, traces in classid_to_ids.items() for v in traces}
-# id_to_classid --> {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0, 8: 0, 9: 0, 10: 1,...]
+# The rest of the script (build_pos_pairs_for_id, build_positive_pairs, etc.)
+# should work with the new classid_to_ids and id_to_classid, and all_traces
+# as long as the 0-indexed class_ids are used consistently.
 
-# open trace
-all_traces = []
-for path in id_to_path.values():
-    each_path = Training_Data_PATH + path
-    with open(each_path, 'rb') as handle:
-        each_trace = pickle.load(handle)
-    all_traces += [each_trace]
+# ---- The following original code for file-based loading is now replaced ----
+# # Extract all folders' names
+# dirs = sorted(os.listdir(Training_Data_PATH))
+# 
+# # Each given folder name (URL of each class), we assign class id
+# # e.g. {'adp.com' : 23, ...}
+# name_to_classid = {d:i for i,d in enumerate(dirs)}
+# 
+# # Just reverse from previous step
+# # Each given class id, show the folder name (URL of each class)
+# # e.g. {23 : 'adp.com', ...}
+# classid_to_name = {v:k for k,v in name_to_classid.items()}
+# 
+# num_classes = len(name_to_classid)
+# print("number of classes: "+str(num_classes))
+# 
+# # Each directory, there are n traces corresponding to the identity
+# # We map each trace path with an integer id, then build dictionaries
+# # We are mapping
+# #   path_to_id and id_to_path
+# #   classid_to_ids and id_to_classid
+# 
+# # read all directories
+# # c is class
+# # name_to_classid.items() contains [(directory, classid), ('slickdeals.net', 547), ...]
+# 
+# trace_paths = {c:[directory + "/" + img for img in sorted(os.listdir(Training_Data_PATH + directory))]
+#          for directory,c in name_to_classid.items()}
+# # trace_paths --> {0: ['104.com.tw/104.com.tw_0001.pkl', '104.com.tw/104.com.tw_0002.pkl',...] ,....}
+# 
+# # retreive all traces
+# # to create the list of all traces paths
+# all_traces_path = []
+# for trace_list in trace_paths.values():
+#     all_traces_path += trace_list
+# # all_trace_path --> ['104.com.tw/104.com.tw_0001.pkl', '104.com.tw/104.com.tw_0002.pkl',...]
+# # len(all_trace_path = num_class * num_examples e.g. 700 * 25
+# 
+# # map to integers
+# # just map each path to sequence of ID (from 1 to len(all_trace_path)
+# path_to_id = {v: k for k, v in enumerate(all_traces_path)}
+# # path_to_id --> {'chron.com/chron.com_0006.pkl': 1185, 'habrahabr.ru/habrahabr.ru_0001.pkl': 2680, ...}
+# id_to_path = {v: k for k, v in path_to_id.items()}
+# # id_to_path --> {0: '104.com.tw/104.com.tw_0001.pkl', 1: '104.com.tw/104.com.tw_0002.pkl', ...}
+# 
+# # build mapping between traces and class
+# classid_to_ids = {k: [path_to_id[path] for path in v] for k, v in trace_paths.items()}
+# # classid_to_ids --> {0: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 1: [10, 11, 12, 13, 14, 15, 16, 17, 18, 19],...]
+# id_to_classid = {v: c for c, traces in classid_to_ids.items() for v in traces}
+# # id_to_classid --> {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0, 8: 0, 9: 0, 10: 1,...]
+# 
+# # open trace
+# all_traces = []
+# for path in id_to_path.values():
+#     each_path = Training_Data_PATH + path
+#     with open(each_path, 'rb') as handle:
+#         each_trace = pickle.load(handle)
+#     all_traces += [each_trace]
+# 
+# all_traces = np.vstack((all_traces))
+# all_traces = all_traces[:, :, np.newaxis]
+# print("Load traces with ",all_traces.shape)
+# print("Total size allocated on RAM : ", str(all_traces.nbytes / 1e6) + ' MB')
+# ---- End of replaced original code ----
 
-all_traces = np.vstack((all_traces))
-all_traces = all_traces[:, :, np.newaxis]
-print "Load traces with ",all_traces.shape
-print "Total size allocated on RAM : ", str(all_traces.nbytes / 1e6) + ' MB'
-
-def build_pos_pairs_for_id(classid): # classid --> e.g. 0
+def build_pos_pairs_for_id(classid): # classid --> e.g. 0 (this is the 0-indexed class_id)
     traces = classid_to_ids[classid]
     # pos_pairs is actually the combination C(10,2)
     # e.g. if we have 10 example [0,1,2,...,9]
@@ -133,8 +206,8 @@ Xa_train, Xp_train = build_positive_pairs(range(0, num_classes))
 # Gather the ids of all network traces that are used for training
 # This just union of two sets set(A) | set(B)
 all_traces_train_idx = list(set(Xa_train) | set(Xp_train))
-print "X_train Anchor: ", Xa_train.shape
-print "X_train Positive: ", Xp_train.shape
+print("X_train Anchor: ", Xa_train.shape)
+print("X_train Positive: ", Xp_train.shape)
 
 # Build a loss which doesn't take into account the y_true, as# Build
 # we'll be passing only 0
@@ -251,7 +324,7 @@ loss = Lambda(cosine_triplet_loss,
 model_triplet = Model(
     inputs=[anchor, positive, negative],
     outputs=loss)
-print model_triplet.summary()
+print(model_triplet.summary())
 
 opt = optimizers.SGD(lr=0.001, decay=1e-6, momentum=0.9, nesterov=True)
 
@@ -261,7 +334,7 @@ batch_size = batch_size_value
 # At first epoch we don't generate hard triplets
 gen_hard = SemiHardTripletGenerator(Xa_train, Xp_train, batch_size, all_traces, all_traces_train_idx, None)
 nb_epochs = number_epoch
-csv_logger = CSVLogger('log/Training_Log_%s.csv'%description, append=True, separator=';')
+csv_logger = CSVLogger('./src/model_training/log/Training_Log_%s.csv'%description, append=True, separator=';')
 for epoch in range(nb_epochs):
     print("built new hard generator for epoch "+str(epoch))
     model_triplet.fit_generator(generator=gen_hard.next_train(),

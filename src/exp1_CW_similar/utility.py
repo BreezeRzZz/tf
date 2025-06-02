@@ -1,4 +1,4 @@
-import cPickle as pickle
+import pickle
 import os
 import random
 from sklearn.neighbors import KNeighborsClassifier
